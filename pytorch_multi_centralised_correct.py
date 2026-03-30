@@ -85,7 +85,7 @@ env = TransformedEnv(  # RewardSum transform which will sum rewards over the epi
 )
 check_env_specs(env)
 
-# SEE RANDOM POLICY IN ACTION
+print("Rendering a random policy to see the environment...")
 with torch.no_grad():
    env.rollout(
        max_steps=max_steps,
@@ -160,7 +160,7 @@ policy = ProbabilisticActor(
 # parameters. Sharing is not recommended when agents have different reward functions, as the critics will need to learn
 # to assign different values to the same state. In decentralised training settings, sharing cannot be performed without
 # additional infrastructure to synchronise parameters.
-share_parameters_critic = True
+share_parameters_critic = False
 mappo = True  # -> IPPO if False (MAPPO = centralised critic with full obs, IPPO = decentralised critic)
 
 critic_net = MultiAgentMLP(
@@ -242,6 +242,7 @@ GAE = loss_module.value_estimator
 
 optim = torch.optim.Adam(loss_module.parameters(), lr)
 
+print("Starting training...")
 ##### ACTUAL TRAINING STARTS HERE #####
 # Core loop is:
 #   Collect data
@@ -310,6 +311,7 @@ for tensordict_data in collector:
 ###########################
 ##### LEARNING CURVES #####
 ###########################
+print("Training completed, plotting learning curves...")
 plt.plot(episode_reward_mean_list)
 plt.xlabel("Training iterations")
 plt.ylabel("Reward")
@@ -319,6 +321,7 @@ plt.show()
 ###############################
 ##### RENDERLEARNT POLICY #####
 ###############################
+print("Rendering learnt policy...")
 with torch.no_grad():
    env.rollout(
        max_steps=max_steps,

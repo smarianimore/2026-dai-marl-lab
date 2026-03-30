@@ -15,7 +15,8 @@ class Params(NamedTuple):  # https://docs.python.org/3/library/collections.html#
     episodes: int  # Episode = "1 game run (e.g. until win or lose or maximum "play time" reached)
     lr: float  # Learning rate ("how fast" the agent adapts to changes---learns)
     gamma: float  # Discounting rate ("how much value" to give to future vs immediate rewards)
-    e: float  # Exploration probability (e.g. do random action instead of arg_max(Q_values)
+    e_init: float  # Initial exploration rate (e.g. do random action instead of arg_max(Q_values))
+    e_min: float  # Minimum exploration rate (floor after exponential decay)
     map_size: int  # Number of tiles of one side of the squared environment
     seed: int  # Define a seed so that we get reproducible results
     is_slippery: bool  # If true the player will move in intended direction with probability of 1/3 else will move in either perpendicular direction with equal probability of 1/3 in both directions
@@ -24,21 +25,26 @@ class Params(NamedTuple):  # https://docs.python.org/3/library/collections.html#
     state_size: int  # Number of possible states
     prob_frozen: float  # Probability that a tile is frozen
     savefig_folder: Path  # Root folder where plots are saved
+    rolling_window_frac: int  # Denominator for the rolling-mean window: window = episodes // rolling_window_frac
+    phase_frac: int  # Denominator for the first/last phase slice in reward distribution: slice = episodes // phase_frac
 
 
 params = Params(
-    episodes=250_000,
+    episodes=10_000,
     lr=0.1,  # learn "slowly" (=do not change Q-values too much at once)
     gamma=0.9,  # give value to future rewards ('cause we need many steps to reach the destination!)
-    e=0.1,
-    map_size=5,
+    e_init=0.9,  # start exploring 90% of the time
+    e_min=0.05,  # never go below 5% exploration
+    map_size=7,
     seed=123,
     is_slippery=False,
-    runs=3,
+    runs=1,
     action_size=None,
     state_size=None,
-    prob_frozen=0.9,
+    prob_frozen=0.9,  # probability that a tile is NOT frozen (I know, it's confusing but it is not my fault :/)
     savefig_folder=Path("res/frozenlake/"),
+    rolling_window_frac=50,  # rolling window = episodes // 50  (i.e. 2% of episodes)
+    phase_frac=10,           # first/last phase = episodes // 10  (i.e. 1/10 of episodes)
 )
 
 rng = np.random.default_rng(params.seed)
@@ -72,13 +78,30 @@ class QLearningAgent:
 
 
 class EpsilonGreedy:
-    """Exploration strategy"""
-    def __init__(self, e):  # exploration probability
-        self.e = e
+    """Exploration strategy with exponential epsilon decay.
 
-    def choose_action(self, action_s, state, qtable):
+    e_decay is computed so that at 2/3 of total training episodes the current
+    exploration rate reaches e_min:
+        e_min = e_init * e_decay ^ (2/3 * episodes)
+        => e_decay = (e_min / e_init) ^ (3 / (2 * episodes))
+    """
+    def __init__(self, e_init, e_min, e_decay):
+        self.e_init  = e_init   # initial exploration rate
+        self.e_min   = e_min    # minimum exploration rate (floor)
+        self.e_decay = e_decay  # multiplicative decay factor applied after each episode
+        self.e = e_init         # current exploration rate
+
+    def reset(self):
+        """Reset to the initial exploration rate (call at the start of each run)."""
+        self.e = self.e_init
+
+    def decay(self):
+        """Apply one exponential decay step; never go below e_min."""
+        self.e = max(self.e_min, self.e * self.e_decay)
+
+    def choose_action(self, action_s, state, qtable, test: bool=False):
         rnd = rng.uniform(0, 1)
-        if rnd < self.e:
+        if rnd < self.e and not test:  # If we are testing we don't want to explore
             action = action_s.sample()  # random action (e.g. e=0.1 means 10% of the time)
         else:
             if np.all(qtable[state, :] == qtable[state, 0]):  # If all actions are the same for this state we choose a random one (otherwise `np.argmax()` would always take the first one)
@@ -97,13 +120,18 @@ def run_env():
     qtables = np.zeros((params.runs, params.state_size, params.action_size))
     all_states = []
     all_actions = []
+    e_history = []  # exploration rate used at the start of each episode (recorded from run 0)
 
     for run in range(params.runs):  # 1 run is one experiment (series of episodes)
         learner.init_qtable()
+        explorer.reset()  # reset e to e_init at the start of every run
 
         for episode in tqdm(
             episodes, desc=f"Run {run + 1}/{params.runs} - Episodes", leave=False
         ):
+            if run == 0:
+                e_history.append(explorer.e)  # record e used for this episode
+
             state, _ = env.reset(seed=params.seed)
             step = 0
             done = False
@@ -111,7 +139,7 @@ def run_env():
 
             while not done:  # the Gymnasium environment itself tells us when it's done (episode ended)
                 action = explorer.choose_action(
-                    action_s=env.action_space, state=state, qtable=learner.qtable
+                    action_s=env.action_space, state=state, qtable=learner.qtable, test=False
                 )
 
                 all_states.append(state)
@@ -128,15 +156,20 @@ def run_env():
                 step += 1  # keep track of steps needed to reach the goal
                 state = next_s
             rewards[episode, run] = total_rewards
-            steps[episode, run] = step
+            # For failed episodes (reward=0) the actual step count is misleadingly
+            # small (e.g. 1–2 steps into a hole).  Use map_size² as a penalty value
+            # so failures are clearly visible as a high step count in the plot.
+            steps[episode, run] = step if total_rewards > 0 else params.state_size
+
+            explorer.decay()  # apply epsilon decay once per episode, after it ends
+
         qtables[run, :, :] = learner.qtable
 
-    return rewards, steps, episodes, qtables, all_states, all_actions
+    return rewards, steps, episodes, qtables, all_states, all_actions, e_history
 
 #############################################
 # CODE BELOW IS JUST FOR NICE VISUALIZATION #
 #############################################
-
 
 def to_pandas(episodes, params, rewards, steps, map_size):
     """Convert the results of the simulation in Pandas dataframes."""
@@ -147,7 +180,6 @@ def to_pandas(episodes, params, rewards, steps, map_size):
             "Steps": steps.flatten()
         }
     )
-    res["cumul_rewards"] = rewards.cumsum(axis=0).flatten(order="F")
     res["map_size"] = np.repeat(f"{map_size}x{map_size}", res.shape[0])
 
     st = pd.DataFrame(data={"Episodes": episodes, "Steps": steps.mean(axis=1)})
@@ -156,15 +188,26 @@ def to_pandas(episodes, params, rewards, steps, map_size):
 
 
 def plot_steps_and_rewards(rewards_df, steps_df):
-    """Plot the steps and rewards from dataframes."""
+    """Plot the rolling success rate and averaged steps from dataframes."""
+    window = max(1, params.episodes // params.rolling_window_frac)  # rolling smoothing window
+    rewards_df = rewards_df.copy()
+    rewards_df["Rolling reward"] = (
+        rewards_df.groupby("map_size")["Rewards"]
+        .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+    )
+    steps_df = steps_df.copy()
+    steps_df["Rolling steps"] = (
+        steps_df.groupby("map_size")["Steps"]
+        .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+    )
     fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(15, 5))
     sns.lineplot(
-        data=rewards_df, x="Episodes", y="cumul_rewards", hue="map_size", ax=ax[0]
+        data=rewards_df, x="Episodes", y="Rolling reward", hue="map_size", ax=ax[0]
     )
-    ax[0].set(ylabel="Cumulated rewards")
+    ax[0].set(ylabel=f"Success rate (rolling mean, window={window})")
 
-    sns.lineplot(data=steps_df, x="Episodes", y="Steps", hue="map_size", ax=ax[1])
-    ax[1].set(ylabel="Averaged steps number")
+    sns.lineplot(data=steps_df, x="Episodes", y="Rolling steps", hue="map_size", ax=ax[1])
+    ax[1].set(ylabel=f"Avg. steps (rolling mean, window={window})\nfailures penalised at map_size²")
 
     for axi in ax:
         axi.legend(title="map size")
@@ -242,14 +285,106 @@ def plot_states_actions_distribution(states, actions, map_size):
     fig.savefig(params.savefig_folder / img_title, bbox_inches="tight")
     plt.show()
 
+def plot_reward_distribution(rewards_df, map_size):
+    """Compare the episodic reward distribution between the first and last 1/10 of training
+    using box plots. For binary 0/1 rewards the median shift from 0 to 1 directly shows
+    that the agent has learned to reach the goal reliably."""
+    tenth = params.episodes // params.phase_frac
+
+    first = rewards_df[rewards_df["Episodes"] < tenth].copy()
+    first["Phase"] = f"First 1/{params.phase_frac}\n(ep. 1–{tenth:,})"
+
+    last = rewards_df[rewards_df["Episodes"] >= params.episodes - tenth].copy()
+    last["Phase"] = f"Last 1/{params.phase_frac}\n(ep. {params.episodes - tenth + 1:,}–{params.episodes:,})"
+
+    combined = pd.concat([first, last])
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.boxplot(
+        data=combined, x="Phase", y="Rewards", ax=ax,
+        palette=["salmon", "steelblue"], width=0.4,
+        order=[first["Phase"].iloc[0], last["Phase"].iloc[0]],
+    )
+    ax.set_title(
+        f"Episodic reward: first vs last 1/{params.phase_frac} of training\nmap {map_size}x{map_size}"
+    )
+    ax.set_ylabel("Episodic reward  (0 = fail, 1 = goal reached)")
+    ax.set_xlabel("")
+    ax.set_yticks([0, 1])
+    fig.tight_layout()
+    img_title = f"frozenlake_reward_distribution_{map_size}x{map_size}.png"
+    fig.savefig(params.savefig_folder / img_title, bbox_inches="tight")
+    plt.show()
+
+
+def plot_states_visits_map(all_states, map_size):
+    """Plot a heatmap of how often each tile (state) was visited during training,
+    normalised by the total number of state visits."""
+    state_counts = np.zeros(map_size * map_size)
+    for s in all_states:
+        state_counts[s] += 1
+    total_visits = state_counts.sum()
+    state_freqs = (state_counts / total_visits).reshape(map_size, map_size)
+
+    # Annotate each cell with the normalised frequency as a percentage
+    annot = np.array(
+        [[f"{state_freqs[r, c]:.1%}" for c in range(map_size)] for r in range(map_size)]
+    )
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.heatmap(
+        state_freqs,
+        annot=annot,
+        fmt="",
+        ax=ax,
+        cmap=sns.color_palette("Greens", as_cmap=True),
+        linewidths=0.7,
+        linecolor="black",
+        xticklabels=[],
+        yticklabels=[],
+        annot_kws={"fontsize": "large"},
+    ).set(title="State visit frequency\n(normalised over total visits)")
+    for _, spine in ax.spines.items():
+        spine.set_visible(True)
+        spine.set_linewidth(0.7)
+        spine.set_color("black")
+    fig.tight_layout()
+    img_title = f"frozenlake_state_visits_{map_size}x{map_size}.png"
+    fig.savefig(params.savefig_folder / img_title, bbox_inches="tight")
+    plt.show()
+
+
+def plot_epsilon_decay(e_history, map_size):
+    """Plot the exploration rate (epsilon) used at each episode during training."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(e_history, color="steelblue", linewidth=1.5, label="ε (current)")
+    ax.axhline(y=params.e_min, color="red", linestyle="--", linewidth=1,
+               label=f"e_min = {params.e_min}")
+    ax.axhline(y=params.e_init, color="green", linestyle="--", linewidth=1,
+               label=f"e_init = {params.e_init}")
+    ax.axvline(x=int(2 / 3 * params.episodes), color="orange", linestyle=":",
+               linewidth=1, label=f"2/3 of training (ep. {int(2 / 3 * params.episodes):,})")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Exploration rate (ε)")
+    ax.set_title(f"Epsilon decay over training — map {map_size}x{map_size}")
+    ax.legend()
+    fig.tight_layout()
+    img_title = f"frozenlake_epsilon_decay_{map_size}x{map_size}.png"
+    fig.savefig(params.savefig_folder / img_title, bbox_inches="tight")
+    plt.show()
+
+
+#############################
+# MAIN FUNCTION TO RUN CODE #
+#############################
 
 if __name__ == "__main__":
 
-    #map_sizes = [4, 7, 10, 13]
     map_sizes = [7]
     res_all = pd.DataFrame()
     st_all = pd.DataFrame()
 
+    current_map = None
     for map_size in map_sizes:
         current_map = generate_random_map(
                 size=map_size, p=params.prob_frozen, seed=params.seed
@@ -273,18 +408,24 @@ if __name__ == "__main__":
             state_s=params.state_size,
             action_s=params.action_size,
         )
+        # e_decay so that at 2/3 of training episodes, e reaches e_min:
+        #   e_min = e_init * e_decay^(2/3 * episodes)  =>  e_decay = (e_min/e_init)^(3/(2*episodes))
+        e_decay = (params.e_min / params.e_init) ** (3 / (2 * params.episodes))
         explorer = EpsilonGreedy(
-            e=params.e,
+            e_init=params.e_init,
+            e_min=params.e_min,
+            e_decay=e_decay,
         )
 
+        print("Let the agent play 1 episode before training to see initial behavior")
         for ep in tqdm(
-                range(10), desc=f"Episodes", leave=False
+                range(1), desc=f"Episodes", leave=False
         ):
             state, _ = env.reset(seed=params.seed)
             done = False
             while not done:
                 action = explorer.choose_action(
-                    action_s=env.action_space, state=state, qtable=learner.qtable
+                    action_s=env.action_space, state=state, qtable=learner.qtable, test=False
                 )
                 next_s, _, term, trunc, _ = env.step(action)
                 done = term or trunc
@@ -303,8 +444,9 @@ if __name__ == "__main__":
             params.seed
         )
 
+        print("Now training the agent...")
         print(f"\nMap size: {map_size}x{map_size}")
-        rewards, steps, episodes, qtables, all_states, all_actions = run_env()
+        rewards, steps, episodes, qtables, all_states, all_actions, e_history = run_env()  # multiple episodes, as per config
 
         # Save the results in dataframes
         res, st = to_pandas(episodes, params, rewards, steps, map_size)
@@ -315,11 +457,23 @@ if __name__ == "__main__":
         #plot_states_actions_distribution(
         #    states=all_states, actions=all_actions, map_size=map_size
         #)  # Sanity check
+
+        print("Plotting epsilon decay...")
+        plot_epsilon_decay(e_history, map_size)
+
+        print("Plotting state visit frequencies...")
+        plot_states_visits_map(all_states, map_size)
+
+        print("Plotting reward distribution (first vs last 1/10 of training)...")
+        plot_reward_distribution(res, map_size)
+
+        print(f"Plotting learned Q-values (averaged over {params.runs})...")
         plot_q_values_map(qtable, env, map_size)
 
         env.close()
 
-    #plot_steps_and_rewards(res_all, st_all)
+    print("Plotting steps and rewards...")
+    plot_steps_and_rewards(res_all, st_all)
 
     ################################
     #### SEE WHAT AGENT LEARNT #####
@@ -336,6 +490,7 @@ if __name__ == "__main__":
         params.seed
     )
 
+    print("Let the trained agent play 10 episodes to see learned behavior")
     for ep in tqdm(
             range(10), desc=f"Episodes", leave=False
         ):
@@ -343,7 +498,7 @@ if __name__ == "__main__":
         done = False
         while not done:
             action = explorer.choose_action(
-                action_s=env.action_space, state=state, qtable=learner.qtable
+                action_s=env.action_space, state=state, qtable=learner.qtable, test=True
             )
             next_s, _, term, trunc, _ = env.step(action)
             done = term or trunc
