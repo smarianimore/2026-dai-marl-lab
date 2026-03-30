@@ -464,6 +464,9 @@ if __name__ == "__main__":
         print("Plotting state visit frequencies...")
         plot_states_visits_map(all_states, map_size)
 
+        print("Plotting steps and rewards...")
+        plot_steps_and_rewards(res_all, st_all)
+
         print("Plotting reward distribution (first vs last 1/10 of training)...")
         plot_reward_distribution(res, map_size)
 
@@ -471,9 +474,6 @@ if __name__ == "__main__":
         plot_q_values_map(qtable, env, map_size)
 
         env.close()
-
-    print("Plotting steps and rewards...")
-    plot_steps_and_rewards(res_all, st_all)
 
     ################################
     #### SEE WHAT AGENT LEARNT #####
