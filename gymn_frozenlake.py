@@ -38,7 +38,7 @@ params = Params(
     map_size=7,
     seed=123,
     is_slippery=False,
-    runs=1,
+    runs=3,
     action_size=None,
     state_size=None,
     prob_frozen=0.9,  # probability that a tile is NOT frozen (I know, it's confusing but it is not my fault :/)
@@ -172,43 +172,93 @@ def run_env():
 #############################################
 
 def to_pandas(episodes, params, rewards, steps, map_size):
-    """Convert the results of the simulation in Pandas dataframes."""
+    """Convert the results of the simulation in Pandas dataframes.
+
+    Returns
+    -------
+    res : DataFrame
+        One row per (episode, run) — used for the reward-distribution box plot.
+        Episodes are aligned with np.repeat so that episode i pairs with all
+        run values for that episode (fixes the np.tile misalignment for runs>1).
+    st : DataFrame
+        One row per episode — rewards and steps averaged over runs.
+        Used for the rolling line-plots so the smoothing is applied to the
+        already-averaged signal, not to the interleaved per-run rows.
+    """
+    # Per-run data: np.repeat gives [0,0,1,1,...] which aligns with the
+    # C-order flatten [r[0,run0], r[0,run1], r[1,run0], r[1,run1], ...]
     res = pd.DataFrame(
         data={
-            "Episodes": np.tile(episodes, reps=params.runs),
-            "Rewards": rewards.flatten(),
+            "Episodes": np.repeat(episodes, repeats=params.runs),
+            "Rewards": rewards.flatten(),   # C-order matches np.repeat
             "Steps": steps.flatten()
         }
     )
     res["map_size"] = np.repeat(f"{map_size}x{map_size}", res.shape[0])
 
-    st = pd.DataFrame(data={"Episodes": episodes, "Steps": steps.mean(axis=1)})
+    # Per-episode averaged data: mean over the runs axis for both metrics
+    st = pd.DataFrame(data={
+        "Episodes": episodes,
+        "Rewards": rewards.mean(axis=1),   # run-averaged episodic reward
+        "Steps":   steps.mean(axis=1),     # run-averaged episodic steps
+    })
     st["map_size"] = np.repeat(f"{map_size}x{map_size}", st.shape[0])
     return res, st
 
 
-def plot_steps_and_rewards(rewards_df, steps_df):
-    """Plot the rolling success rate and averaged steps from dataframes."""
-    window = max(1, params.episodes // params.rolling_window_frac)  # rolling smoothing window
-    rewards_df = rewards_df.copy()
-    rewards_df["Rolling reward"] = (
-        rewards_df.groupby("map_size")["Rewards"]
-        .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
-    )
-    steps_df = steps_df.copy()
-    steps_df["Rolling steps"] = (
-        steps_df.groupby("map_size")["Steps"]
-        .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
-    )
+def plot_steps_and_rewards(steps_df):
+    """Plot rolling mean ± rolling std for the success rate and average steps.
+
+    Both metrics come from *steps_df*, whose Rewards and Steps columns are
+    already averaged over runs for each episode.  Using run-averaged values
+    here is important: applying the rolling window to interleaved per-run
+    rows would mix episodes from different runs at every window boundary.
+
+    The shaded band is ± one rolling standard deviation computed over the
+    same window as the mean, so it reflects how consistent the agent's
+    performance is within that recent stretch of episodes.
+    """
+    window = max(1, params.episodes // params.rolling_window_frac)
+    df = steps_df.copy()
+
+    for col in ("Rewards", "Steps"):
+        df[f"{col}_mean"] = df.groupby("map_size")[col].transform(
+            lambda x: x.rolling(window=window, min_periods=1).mean()
+        )
+        df[f"{col}_std"] = df.groupby("map_size")[col].transform(
+            # std is NaN for the very first point (only 1 sample); fill with 0
+            # so fill_between draws no band there rather than leaving a gap.
+            lambda x: x.rolling(window=window, min_periods=1).std().fillna(0)
+        )
+
     fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(15, 5))
-    sns.lineplot(
-        data=rewards_df, x="Episodes", y="Rolling reward", hue="map_size", ax=ax[0]
+
+    for map_s, group in df.groupby("map_size"):
+        # --- success rate ---
+        (line,) = ax[0].plot(group["Episodes"], group["Rewards_mean"], label=map_s)
+        ax[0].fill_between(
+            group["Episodes"],
+            group["Rewards_mean"] - group["Rewards_std"],
+            group["Rewards_mean"] + group["Rewards_std"],
+            alpha=0.25, color=line.get_color(),
+        )
+        # --- steps ---
+        (line,) = ax[1].plot(group["Episodes"], group["Steps_mean"], label=map_s)
+        ax[1].fill_between(
+            group["Episodes"],
+            group["Steps_mean"] - group["Steps_std"],
+            group["Steps_mean"] + group["Steps_std"],
+            alpha=0.25, color=line.get_color(),
+        )
+
+    ax[0].set(
+        xlabel="Episodes",
+        ylabel=f"Success rate\n(rolling mean ± std, window={window})",
     )
-    ax[0].set(ylabel=f"Success rate (rolling mean, window={window})")
-
-    sns.lineplot(data=steps_df, x="Episodes", y="Rolling steps", hue="map_size", ax=ax[1])
-    ax[1].set(ylabel=f"Avg. steps (rolling mean, window={window})\nfailures penalised at map_size²")
-
+    ax[1].set(
+        xlabel="Episodes",
+        ylabel=f"Avg. steps\n(rolling mean ± std, window={window})\nfailures penalised at map_size²",
+    )
     for axi in ax:
         axi.legend(title="map size")
     fig.tight_layout()
@@ -417,7 +467,7 @@ if __name__ == "__main__":
             e_decay=e_decay,
         )
 
-        print("Let the agent play 1 episode before training to see initial behavior")
+        print("Let the agent play before training to see initial behavior")
         for ep in tqdm(
                 range(1), desc=f"Episodes", leave=False
         ):
@@ -465,9 +515,9 @@ if __name__ == "__main__":
         plot_states_visits_map(all_states, map_size)
 
         print("Plotting steps and rewards...")
-        plot_steps_and_rewards(res_all, st_all)
+        plot_steps_and_rewards(st_all)
 
-        print("Plotting reward distribution (first vs last 1/10 of training)...")
+        print("Plotting reward distribution (early vs late stages of training)...")
         plot_reward_distribution(res, map_size)
 
         print(f"Plotting learned Q-values (averaged over {params.runs})...")
@@ -490,9 +540,9 @@ if __name__ == "__main__":
         params.seed
     )
 
-    print("Let the trained agent play 10 episodes to see learned behavior")
+    print("Let the trained agent play episodes to see learned behavior")
     for ep in tqdm(
-            range(10), desc=f"Episodes", leave=False
+            range(1), desc=f"Episodes", leave=False
         ):
         state, _ = env.reset(seed=params.seed)
         done = False
