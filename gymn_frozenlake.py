@@ -33,11 +33,11 @@ params = Params(
     episodes=10_000,
     lr=0.1,  # learn "slowly" (=do not change Q-values too much at once)
     gamma=0.9,  # give value to future rewards ('cause we need many steps to reach the destination!)
-    e_init=0.9,  # start exploring 90% of the time
+    e_init=0.5,  # start exploring 90% of the time
     e_min=0.05,  # never go below 5% exploration
     map_size=7,
     seed=123,
-    is_slippery=False,
+    is_slippery=True,
     runs=3,
     action_size=None,
     state_size=None,
@@ -64,7 +64,7 @@ class QLearningAgent:
         self.qtable = self.init_qtable()
 
     def update(self, state, action, reward, next_state):
-        """Q(s,a):= Q(s,a) + lr [R(s,a) + gamma * max Q(s',a') - Q(s,a)]"""
+        """Q(s,a):= Q(s,a) + lr [r + gamma * max Q(s',a') - Q(s,a)]"""
         delta = (
                 reward
                 + self.gamma * np.max(self.qtable[next_state, :])
@@ -542,7 +542,7 @@ if __name__ == "__main__":
 
     print("Let the trained agent play episodes to see learned behavior")
     for ep in tqdm(
-            range(1), desc=f"Episodes", leave=False
+            range(10), desc=f"Episodes", leave=False
         ):
         state, _ = env.reset(seed=params.seed)
         done = False

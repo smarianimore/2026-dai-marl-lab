@@ -317,11 +317,11 @@ plt.title("Episode reward mean")
 plt.show()
 
 ###############################
-##### RENDERLEARNT POLICY #####
+##### RENDER LEARNT POLICY #####
 ###############################
 with torch.no_grad():
    env.rollout(
-       max_steps=max_steps,
+       max_steps=max_steps*3,
        policy=policy,
        callback=lambda env, _: env.render(),
        auto_cast_to_device=True,
